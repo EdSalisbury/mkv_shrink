@@ -1,0 +1,22 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Build/packaging artifacts
+*.egg-info/
+dist/
+build/
+
+# Logs
+mkv_shrink.log
+
+# OS / Editor junk
+.DS_Store
+Thumbs.db

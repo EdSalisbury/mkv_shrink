@@ -1,0 +1,18 @@
+# mkv_shrink/config.toml
+
+[incoming]
+path = "I:/Videos/incoming"
+
+[output]
+path = "I:/Videos/output"
+
+[done]
+path = "I:/Videos/done"
+
+[watcher]
+check_interval = 10 # seconds
+stable_times = 3    # consecutive size checks
+
+[shrink]
+codec = "h264"      # default codec
+prefer_nvenc = true

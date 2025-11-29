@@ -1,0 +1,11 @@
+[project]
+name = "mkv-shrink"
+version = "0.1.0"
+description = "Automatic MKV shrinking and watcher"
+authors = [{ name = "Ed Salisbury" }]
+requires-python = ">=3.9"
+dependencies = ["watchdog>=3.0.0"]
+
+[project.scripts]
+mkv-shrink = "mkv_shrink.shrink:main"
+mkv-shrink-watcher = "mkv_shrink.watcher:main"
