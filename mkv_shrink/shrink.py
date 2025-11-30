@@ -282,7 +282,11 @@ def probe_video_aspect(input_file: str) -> tuple[int | None, int | None, float |
 
 
 def detect_crop(
-    input_file: str, start_seconds: int = 600, frames: int = 400
+    input_file: str,
+    start_seconds: int = 600,
+    frames: int = 400,
+    limit: int = 24,
+    allow_fallback: bool = True,
 ) -> list[str]:
     """
     Detect stable crop region using ffmpeg cropdetect.
@@ -303,7 +307,7 @@ def detect_crop(
             "-i",
             input_file,
             "-vf",
-            "cropdetect=limit=24:round=2",
+            f"cropdetect=limit={limit}:round=2",
             "-frames:v",
             str(frames),
             "-f",
@@ -374,6 +378,32 @@ def detect_crop(
 
         crop_str = f"crop={w}:{h}:{x}:{y}"
         print(f"[INFO] Stable crop region detected: {crop_str}")
+
+        # Fallback for scope/letterboxed content: if AR is suspiciously tall, retry with a more sensitive limit,
+        # but keep whichever crop is wider.
+        ar = w / h
+        if allow_fallback and ar < 2.2 and limit > 2:
+            print(
+                "[INFO] Crop AR looks tall for scope; retrying cropdetect with lower limit for faint bars."
+            )
+            fallback = detect_crop(
+                input_file,
+                start_seconds=start_seconds,
+                frames=frames,
+                limit=2,
+                allow_fallback=False,
+            )
+            if fallback:
+                m_fb = re.search(r"crop=(\d+):(\d+):", fallback[0])
+                if m_fb:
+                    w2, h2 = map(int, m_fb.groups())
+                    ar2 = w2 / h2 if h2 else 0
+                    if ar2 > ar:
+                        print(
+                            f"[INFO] Using fallback crop {fallback[0]} (AR ~{ar2:.3f}) over {crop_str} (AR ~{ar:.3f})"
+                        )
+                        return fallback
+            # keep original if fallback not better
 
         return [crop_str]
 
@@ -479,23 +509,27 @@ def shrink_mkv(input_file: str, output_file: str, codec: str = "h264") -> None:
     if not no_crop and crop_filter:
         crop_str = crop_filter[0]
         filters.append(crop_str)
-        filters.append(
-            "setsar=1"
-        )  # Force square pixels after crop to avoid SAR inheritance
+        filters.append("setsar=1")  # normalize SAR after crop
 
-        # If the cropped frame is tall but source DAR suggests 16:9-ish, normalize DAR without further cropping.
+        # Set DAR based on cropped dimensions and source SAR (if valid); fallback to crop AR.
         m = re.search(r"crop=(\d+):(\d+):", crop_str)
         if m:
             w, h = map(int, m.groups())
-            ar = w / h if h else 0
-            if ar and ar < 1.7 and src_dar and src_dar >= 1.7:
-                filters.append(f"setdar={src_dar:.6f}")
-                print(
-                    f"[INFO] Preserving crop, normalizing DAR to source ({src_dar:.3f}) (crop AR ~{ar:.3f})"
-                )
+            if h:
+                if src_sar and src_sar > 0:
+                    dar = (w * src_sar) / h
+                    filters.append(f"setdar={dar:.6f}")
+                    print(
+                        f"[INFO] Setting DAR from crop+source SAR ({src_sar:.3f}) => {dar:.3f}"
+                    )
+                else:
+                    crop_ar = w / h
+                    filters.append(f"setdar={crop_ar:.6f}")
+                    print(f"[INFO] Setting DAR to crop AR ({crop_ar:.3f}) from {crop_str}")
 
     if filters:
         cmd += ["-vf", ",".join(filters)]
+        print(f"[INFO] Using filters: {filters}")
 
     # Then encoder settings
     cmd += video_opts
