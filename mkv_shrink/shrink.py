@@ -29,12 +29,24 @@ logging.basicConfig(
 
 QUALITY_PRESETS = {
     "h264": {
-        "cpu": ["-preset", "slow", "-crf", "21"],
-        "nvenc": ["-preset", "p5", "-cq", "27"],
+        "cpu": {
+            "dvd": ["-preset", "slow", "-crf", "18"],
+            "bd": ["-preset", "slow", "-crf", "21"],
+        },
+        "nvenc": {
+            "dvd": ["-preset", "p5", "-cq", "18"],
+            "bd": ["-preset", "p5", "-cq", "27"],
+        },
     },
     "hevc": {
-        "cpu": ["-preset", "slow", "-crf", "28"],
-        "nvenc": ["-preset", "p5", "-cq", "28"],
+        "cpu": {
+            "dvd": ["-preset", "slow", "-crf", "20"],
+            "bd": ["-preset", "slow", "-crf", "24"],
+        },
+        "nvenc": {
+            "dvd": ["-preset", "p5", "-cq", "18"],
+            "bd": ["-preset", "p5", "-cq", "24"],
+        },
     },
 }
 
@@ -110,9 +122,19 @@ def filter_streams_by_language(
     return selected
 
 
-def choose_encoder(codec: str, prefer_nvenc: bool = True) -> list[str]:
+def detect_source_type(height: int | None) -> str:
+    """Determine if source is DVD or BD based on video height."""
+    if height is None or height <= 576:  # PAL DVD max is 576, NTSC is 480
+        return "dvd"
+    return "bd"
+
+
+def choose_encoder(
+    codec: str, source_type: str = "bd", prefer_nvenc: bool = True
+) -> list[str]:
     """Return encoder args for h264 or hevc, using NVENC if available."""
     assert codec in ("h264", "hevc"), f"Unsupported codec: {codec}"
+    assert source_type in ("dvd", "bd"), f"Unsupported source type: {source_type}"
 
     if prefer_nvenc:
         try:
@@ -125,13 +147,19 @@ def choose_encoder(codec: str, prefer_nvenc: bool = True) -> list[str]:
             encoders = result.stdout
             nvenc_name = f"{codec}_nvenc"
             if nvenc_name in encoders:
-                print(f"[INFO] Using NVENC encoder: {nvenc_name}")
-                return ["-c:v", nvenc_name] + QUALITY_PRESETS[codec]["nvenc"]
+                preset = QUALITY_PRESETS[codec]["nvenc"][source_type]
+                print(
+                    f"[INFO] Using NVENC encoder: {nvenc_name} with {source_type.upper()} quality preset"
+                )
+                return ["-c:v", nvenc_name] + preset
             print(f"[WARN] {nvenc_name} not available, falling back to CPU.")
         except Exception as e:
             print(f"[WARN] Could not check NVENC support: {e}, using CPU.")
 
-    return ["-c:v", f"lib{codec}"] + QUALITY_PRESETS[codec]["cpu"]
+    preset = QUALITY_PRESETS[codec]["cpu"][source_type]
+    cpu_encoder = {"h264": "libx264", "hevc": "libx265"}[codec]
+    print(f"[INFO] Using CPU encoder: {cpu_encoder} with {source_type.upper()} quality preset")
+    return ["-c:v", cpu_encoder] + preset
 
 
 def order_and_label_audio(
@@ -234,7 +262,9 @@ def build_crop_offsets(input_file: str) -> list[int]:
     return ordered
 
 
-def probe_video_aspect(input_file: str) -> tuple[int | None, int | None, float | None, float | None]:
+def probe_video_aspect(
+    input_file: str,
+) -> tuple[int | None, int | None, float | None, float | None]:
     """Return (width, height, sar, dar) for the first video stream, or None values on failure."""
     try:
         result = subprocess.run(
@@ -456,15 +486,19 @@ def detect_crop_multi(input_file: str) -> list[str]:
 
 def shrink_mkv(input_file: str, output_file: str, codec: str = "h264") -> None:
     """Run ffmpeg to shrink the MKV (video re-encode only)."""
-    video_opts = choose_encoder(codec, prefer_nvenc=True)
-
     is_foreign = "foreign" in input_file.lower()
     no_crop = "no_crop" in input_file.lower()
+    fix_sar = "fix_sar" in input_file.lower()
 
     streams = probe_streams(input_file)
     video_stream = next((s for s in streams if s["type"] == "video"), None)
 
     src_w, src_h, src_sar, src_dar = probe_video_aspect(input_file)
+
+    # Detect source type (DVD vs BD) and choose encoder accordingly
+    source_type = detect_source_type(src_h)
+    print(f"[INFO] Detected source: {src_w}x{src_h} -> {source_type.upper()}")
+    video_opts = choose_encoder(codec, source_type=source_type, prefer_nvenc=True)
 
     # Check for telecine / inerlacing
     vf = []
@@ -478,6 +512,7 @@ def shrink_mkv(input_file: str, output_file: str, codec: str = "h264") -> None:
         else:
             vf = []
 
+    crop_filter = []
     if not no_crop:
         crop_filter = detect_crop_multi(input_file)
 
@@ -502,20 +537,31 @@ def shrink_mkv(input_file: str, output_file: str, codec: str = "h264") -> None:
     # Only the first stream
     cmd += ["-map", "0:v:0"]
 
+    # Build video filter chain
     filters = []
-    if vf:  # from interlace/telecine detection
-        filters.append(vf[-1].replace("-vf ", ""))
 
-    if not no_crop and crop_filter:
+    # 1. Deinterlace first if needed
+    if vf:
+        filters.append("bwdif=1:0:0")
+
+    # 2. Deband for DVDs (helps with MPEG-2 artifacts, especially in gradients/titles)
+    if source_type == "dvd":
+        filters.append("deband")
+
+    # 3. Crop if detected
+    if crop_filter:
         crop_str = crop_filter[0]
         filters.append(crop_str)
-        filters.append("setsar=1")  # normalize SAR after crop
 
         # Set DAR based on cropped dimensions and source SAR (if valid); fallback to crop AR.
+        # If fix_sar is set, force SAR=1 first (for broken sources with bad SAR metadata).
         m = re.search(r"crop=(\d+):(\d+):", crop_str)
         if m:
             w, h = map(int, m.groups())
             if h:
+                if fix_sar:
+                    filters.append("setsar=1")
+                    print("[INFO] fix_sar: forcing SAR=1")
                 if src_sar and src_sar > 0:
                     dar = (w * src_sar) / h
                     filters.append(f"setdar={dar:.6f}")
@@ -525,7 +571,9 @@ def shrink_mkv(input_file: str, output_file: str, codec: str = "h264") -> None:
                 else:
                     crop_ar = w / h
                     filters.append(f"setdar={crop_ar:.6f}")
-                    print(f"[INFO] Setting DAR to crop AR ({crop_ar:.3f}) from {crop_str}")
+                    print(
+                        f"[INFO] Setting DAR to crop AR ({crop_ar:.3f}) from {crop_str}"
+                    )
 
     if filters:
         cmd += ["-vf", ",".join(filters)]
@@ -551,10 +599,14 @@ def shrink_mkv(input_file: str, output_file: str, codec: str = "h264") -> None:
         cmd += ["-map", f"0:{idx}", f"-c:s:{s_index}", "copy"]
         s_index += 1
 
-    # Keep attachments/chapters
+    # Attachments and other streams (fonts, images, data, etc.)
+    for idx in keep["other"]:
+        cmd += ["-map", f"0:{idx}"]
+
+    # Keep chapters and metadata
     cmd += ["-map_chapters", "0", "-map_metadata", "0"]
 
-    cmd += ["-movflags", "+faststart", output_file]
+    cmd += [output_file]
 
     print("[INFO] Running:", " ".join(cmd))
     result = subprocess.run(cmd, capture_output=True, text=True)
