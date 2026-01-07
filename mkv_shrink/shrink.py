@@ -582,7 +582,28 @@ def shrink_mkv(input_file: str, output_file: str, codec: str = "h264") -> None:
     # Then encoder settings
     cmd += video_opts
 
-    # Audio: ordered, but don’t touch titles
+    # Color metadata - must be explicit or players will guess wrong (causes desaturation)
+    # Use smpte170m for DVD (NTSC BT.601) and bt709 for HD
+    if source_type == "dvd":
+        # DVD/SD uses SMPTE 170M (NTSC) or BT.470BG (PAL) - smpte170m is the safe choice
+        cmd += [
+            "-colorspace", "smpte170m",
+            "-color_primaries", "smpte170m",
+            "-color_trc", "smpte170m",
+            "-color_range", "tv",
+        ]
+        print("[INFO] Setting color metadata for DVD (SMPTE 170M)")
+    else:
+        # BD/HD is BT.709
+        cmd += [
+            "-colorspace", "bt709",
+            "-color_primaries", "bt709",
+            "-color_trc", "bt709",
+            "-color_range", "tv",
+        ]
+        print("[INFO] Setting color metadata for BD (BT.709)")
+
+    # Audio: ordered, but don't touch titles
     for a_index, s in enumerate(audio_streams):
         cmd += [
             "-map",
