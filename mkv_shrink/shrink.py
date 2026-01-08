@@ -489,6 +489,8 @@ def shrink_mkv(input_file: str, output_file: str, codec: str = "h264") -> None:
     is_foreign = "foreign" in input_file.lower()
     no_crop = "no_crop" in input_file.lower()
     fix_sar = "fix_sar" in input_file.lower()
+    force_widescreen = "force_widescreen" in input_file.lower()
+    force_scope = "force_scope" in input_file.lower()  # Force 2.35:1 theatrical ratio
 
     streams = probe_streams(input_file)
     video_stream = next((s for s in streams if s["type"] == "video"), None)
@@ -554,15 +556,51 @@ def shrink_mkv(input_file: str, output_file: str, codec: str = "h264") -> None:
         filters.append(crop_str)
 
         # Set DAR based on cropped dimensions and source SAR (if valid); fallback to crop AR.
-        # If fix_sar is set, force SAR=1 first (for broken sources with bad SAR metadata).
         m = re.search(r"crop=(\d+):(\d+):", crop_str)
         if m:
             w, h = map(int, m.groups())
             if h:
-                if fix_sar:
+                if force_scope:
+                    # Force 2.21:1 theatrical scope ratio
+                    target_w = int(h * 2.21)
+                    target_w = target_w + (target_w % 2)  # Ensure even
+                    filters.append(f"scale={target_w}:{h}")
+                    filters.append("setsar=1")
+                    filters.append("setdar=2.21")
+                    print(f"[INFO] force_scope: {w}x{h} -> {target_w}x{h} (2.21:1 scope)")
+                elif force_widescreen:
+                    # Preserve the source SAR through the crop, output with correct DAR
+                    # Cropped pixels still have the original SAR (8:9 for NTSC DVD)
+                    # Display width = w * src_sar, display AR = (w * src_sar) / h
+                    if src_sar and src_sar > 0:
+                        display_ar = (w * src_sar) / h
+                    else:
+                        display_ar = w / h
+                    # Keep source SAR (using clean fractions), set DAR to match
+                    if src_sar and src_sar > 0:
+                        if abs(src_sar - 8/9) < 0.01:
+                            filters.append("setsar=8/9")
+                        elif abs(src_sar - 16/15) < 0.01:
+                            filters.append("setsar=16/15")
+                        else:
+                            filters.append(f"setsar={src_sar:.6f}")
+                    filters.append(f"setdar={display_ar:.6f}")
+                    print(f"[INFO] force_widescreen: {w}x{h} SAR={src_sar:.3f} -> DAR={display_ar:.3f}")
+                elif fix_sar:
+                    # Force SAR=1 and use the source DAR directly (ignore SAR for calculation)
                     filters.append("setsar=1")
                     print("[INFO] fix_sar: forcing SAR=1")
-                if src_sar and src_sar > 0:
+                    if src_dar and src_dar > 0:
+                        # Use source DAR directly - this is what the content should display as
+                        filters.append(f"setdar={src_dar:.6f}")
+                        print(f"[INFO] fix_sar: Setting DAR to source DAR ({src_dar:.3f})")
+                    else:
+                        # Fallback to crop AR
+                        crop_ar = w / h
+                        filters.append(f"setdar={crop_ar:.6f}")
+                        print(f"[INFO] fix_sar: Setting DAR to crop AR ({crop_ar:.3f})")
+                elif src_sar and src_sar > 0:
+                    # Calculate DAR from crop dimensions and source SAR
                     dar = (w * src_sar) / h
                     filters.append(f"setdar={dar:.6f}")
                     print(
@@ -574,10 +612,34 @@ def shrink_mkv(input_file: str, output_file: str, codec: str = "h264") -> None:
                     print(
                         f"[INFO] Setting DAR to crop AR ({crop_ar:.3f}) from {crop_str}"
                     )
+    elif force_widescreen:
+        # No crop detected, but force_widescreen requested - scale to 16:9 square pixels
+        if src_h:
+            target_w = int(src_h * 16 / 9)
+            target_w = target_w + (target_w % 2)
+            filters.append(f"scale={target_w}:{src_h}")
+            filters.append("setsar=1")
+            filters.append("setdar=16/9")
+            print(f"[INFO] force_widescreen (no crop): Scaling to {target_w}x{src_h} (16:9 square pixels)")
+
+    # Track the target aspect ratio for -aspect flag
+    output_aspect = None
 
     if filters:
-        cmd += ["-vf", ",".join(filters)]
-        print(f"[INFO] Using filters: {filters}")
+        # Extract setdar value if present and remove setsar/setdar from filter chain
+        # We'll use -aspect instead which is more reliable
+        clean_filters = []
+        for f in filters:
+            if f.startswith("setdar="):
+                output_aspect = f.replace("setdar=", "")
+            elif f.startswith("setsar="):
+                pass  # Skip setsar, we'll use -aspect instead
+            else:
+                clean_filters.append(f)
+
+        if clean_filters:
+            cmd += ["-vf", ",".join(clean_filters)]
+            print(f"[INFO] Using filters: {clean_filters}")
 
     # Then encoder settings
     cmd += video_opts
@@ -602,6 +664,11 @@ def shrink_mkv(input_file: str, output_file: str, codec: str = "h264") -> None:
             "-color_range", "tv",
         ]
         print("[INFO] Setting color metadata for BD (BT.709)")
+
+    # Set aspect ratio at stream level (more reliable than setdar filter)
+    if output_aspect:
+        cmd += ["-aspect", output_aspect]
+        print(f"[INFO] Setting output aspect ratio: {output_aspect}")
 
     # Audio: ordered, but don't touch titles
     for a_index, s in enumerate(audio_streams):
